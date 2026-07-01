@@ -5,6 +5,7 @@ import jwt
 import yaml
 import datetime
 import collections
+import base64
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -13,7 +14,7 @@ from prometheus_client import Counter, generate_latest, CONTENT_TYPE_LATEST
 
 app = FastAPI()
 
-# Assigned Values
+# --- Configurations ---
 ALLOWED_ORIGIN = "https://dash-t1j7qz.example.com"
 EMAIL = "24f2002963@ds.study.iitm.ac.in"
 ANALYTICS_API_KEY = "ak_yjbfppkvvrubzm8lble13mi3"
@@ -22,7 +23,7 @@ ANALYTICS_API_KEY = "ak_yjbfppkvvrubzm8lble13mi3"
 STARTUP_TIME = time.time()
 LOGS_QUEUE = collections.deque(maxlen=1000)
 
-# Prometheus Counter (Any request to any endpoint increments this)
+# Prometheus Counter
 HTTP_REQUESTS_TOTAL = Counter("http_requests_total", "Total HTTP Requests")
 
 # IdP RS256 Public Key
@@ -36,6 +37,8 @@ SI6iyrYbKR0NEBSqq4XkadEjsCs4F1RncsS4LlgniT7GlkL9Mce3b0wGLs9/7ZIX
 dQIDAQAB
 -----END PUBLIC KEY-----"""
 
+
+# --- Schemas ---
 class TokenVerifyRequest(BaseModel):
     token: str
 
@@ -46,6 +49,10 @@ class EventModel(BaseModel):
 
 class AnalyticsRequest(BaseModel):
     events: List[EventModel]
+
+
+# --- Global CORS Paths ---
+CORS_PATHS = ("/effective-config", "/analytics", "/work", "/metrics", "/healthz", "/logs/tail", "/orders")
 
 
 @app.middleware("http")
@@ -61,14 +68,14 @@ async def process_request(request: Request, call_next):
     # Manually handle Preflight OPTIONS requests
     if request.method == "OPTIONS":
         response = Response(status_code=204)
-        if path in ("/effective-config", "/analytics", "/work", "/metrics", "/healthz", "/logs/tail"):
+        if path == "/orders" or path.startswith("/orders") or path in CORS_PATHS:
             response.headers["Access-Control-Allow-Origin"] = origin if origin else "*"
             response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-            response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-API-Key, Authorization, *"
+            response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-API-Key, Authorization, Idempotency-Key, X-Client-Id, *"
         elif origin == ALLOWED_ORIGIN:
             response.headers["Access-Control-Allow-Origin"] = ALLOWED_ORIGIN
             response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-            response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-API-Key, Authorization, *"
+            response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-API-Key, Authorization, Idempotency-Key, X-Client-Id, *"
         
         process_time = time.perf_counter() - start_time
         response.headers["X-Request-ID"] = request_id
@@ -82,7 +89,6 @@ async def process_request(request: Request, call_next):
             "request_id": request_id
         }
         LOGS_QUEUE.append(log_entry)
-        
         return response
 
     # Process standard requests (GET, POST, etc.)
@@ -92,14 +98,14 @@ async def process_request(request: Request, call_next):
         response = JSONResponse(content={"error": "Internal Server Error"}, status_code=500)
 
     # Set CORS Headers based on path rules
-    if path in ("/effective-config", "/analytics", "/work", "/metrics", "/healthz", "/logs/tail"):
+    if path == "/orders" or path.startswith("/orders") or path in CORS_PATHS:
         response.headers["Access-Control-Allow-Origin"] = origin if origin else "*"
         response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-        response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-API-Key, Authorization, *"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-API-Key, Authorization, Idempotency-Key, X-Client-Id, *"
     elif origin == ALLOWED_ORIGIN:
         response.headers["Access-Control-Allow-Origin"] = ALLOWED_ORIGIN
         response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-        response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-API-Key, Authorization, *"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-API-Key, Authorization, Idempotency-Key, X-Client-Id, *"
 
     # Apply mandatory middleware headers to the response
     process_time = time.perf_counter() - start_time
@@ -311,10 +317,8 @@ async def post_analytics(request: Request, request_data: AnalyticsRequest):
 
 
 # --- Question 6: Instrumented Work, Metrics, Logging, and Uptime ---
-
 @app.get("/work")
 async def do_work(n: int = 1):
-    # Perform computation simulation
     sum_val = 0
     for i in range(n * 1000):
         sum_val += i
@@ -323,19 +327,124 @@ async def do_work(n: int = 1):
 
 @app.get("/metrics")
 async def metrics():
-    # Return live Prometheus text format metrics
     return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 @app.get("/healthz")
 async def healthz():
-    # Return uptime status
     uptime = time.time() - STARTUP_TIME
     return {"status": "ok", "uptime_s": uptime}
 
 
 @app.get("/logs/tail")
 async def get_logs(limit: int = 100):
-    # Return last N log entries
     logs_list = list(LOGS_QUEUE)
     return logs_list[-limit:]
+
+
+# --- Question 9: Idempotency, Pagination, and Rate Limiting ---
+
+# Pre-generate catalog of fixed IDs 1 to 56
+CATALOG_TOTAL = 56
+CATALOG = [{"id": i, "item": f"Item #{i}", "price": round(10.0 + i * 1.5, 2)} for i in range(1, CATALOG_TOTAL + 1)]
+
+# Store for idempotent requests: { idempotency_key: response_json }
+IDEMPOTENCY_STORE = {}
+
+# Store for rate limiting: { client_id: [timestamps] }
+RATE_LIMIT_STORE = {}
+RATE_LIMIT_WINDOW = 10.0  # seconds
+RATE_LIMIT_MAX = 18
+
+def check_rate_limit(request: Request):
+    client_id = request.headers.get("X-Client-Id")
+    if not client_id:
+        return None  # If header is missing, skip checking
+
+    now = time.time()
+    if client_id not in RATE_LIMIT_STORE:
+        RATE_LIMIT_STORE[client_id] = []
+
+    # Clean up requests outside our 10-second sliding window
+    timestamps = [t for t in RATE_LIMIT_STORE[client_id] if now - t < RATE_LIMIT_WINDOW]
+    RATE_LIMIT_STORE[client_id] = timestamps
+
+    if len(timestamps) >= RATE_LIMIT_MAX:
+        oldest_ts = timestamps[0]
+        retry_after = int(RATE_LIMIT_WINDOW - (now - oldest_ts))
+        if retry_after <= 0:
+            retry_after = 1
+        return JSONResponse(
+            status_code=429,
+            content={"error": "Too Many Requests"},
+            headers={"Retry-After": str(retry_after)}
+        )
+
+    RATE_LIMIT_STORE[client_id].append(now)
+    return None
+
+def encode_cursor(index: int) -> str:
+    return base64.b64encode(str(index).encode("utf-8")).decode("utf-8")
+
+def decode_cursor(cursor_str: str) -> int:
+    try:
+        return int(base64.b64decode(cursor_str.encode("utf-8")).decode("utf-8"))
+    except Exception:
+        return 0
+
+
+@app.post("/orders")
+async def create_order(request: Request):
+    # 1. Enforce per-client rate limit
+    rate_limit_resp = check_rate_limit(request)
+    if rate_limit_resp:
+        return rate_limit_resp
+
+    # 2. Enforce idempotent order creation
+    idempotency_key = request.headers.get("Idempotency-Key")
+    if idempotency_key:
+        if idempotency_key in IDEMPOTENCY_STORE:
+            saved = IDEMPOTENCY_STORE[idempotency_key]
+            # Standard HTTP idempotency returns the exact original payload
+            return JSONResponse(status_code=saved["status_code"], content=saved["content"])
+
+    new_id = str(uuid.uuid4())
+    order_content = {
+        "id": new_id,
+        "status": "created",
+        "email": EMAIL,
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
+    }
+
+    if idempotency_key:
+        IDEMPOTENCY_STORE[idempotency_key] = {
+            "status_code": 201,
+            "content": order_content
+        }
+
+    return JSONResponse(status_code=201, content=order_content)
+
+
+@app.get("/orders")
+async def get_orders(request: Request, limit: int = 10, cursor: str = None):
+    # 1. Enforce per-client rate limit
+    rate_limit_resp = check_rate_limit(request)
+    if rate_limit_resp:
+        return rate_limit_resp
+
+    # 2. Process cursor-based pagination
+    start_index = 0
+    if cursor:
+        start_index = decode_cursor(cursor)
+
+    # Slice strictly inside the fixed bounds
+    items = CATALOG[start_index : start_index + limit]
+
+    next_cursor = None
+    if start_index + limit < len(CATALOG):
+        next_cursor = encode_cursor(start_index + limit)
+
+    return {
+        "items": items,
+        "next_cursor": next_cursor
+    }
