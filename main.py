@@ -3,10 +3,13 @@ import time
 import uuid
 import jwt
 import yaml
+import datetime
+import collections
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from typing import List
+from prometheus_client import Counter, generate_latest, CONTENT_TYPE_LATEST
 
 app = FastAPI()
 
@@ -14,6 +17,13 @@ app = FastAPI()
 ALLOWED_ORIGIN = "https://dash-t1j7qz.example.com"
 EMAIL = "24f2002963@ds.study.iitm.ac.in"
 ANALYTICS_API_KEY = "ak_yjbfppkvvrubzm8lble13mi3"
+
+# System Startup Tracking & Structured Log Queue (Last 1000 logs)
+STARTUP_TIME = time.time()
+LOGS_QUEUE = collections.deque(maxlen=1000)
+
+# Prometheus Counter (Any request to any endpoint increments this)
+HTTP_REQUESTS_TOTAL = Counter("http_requests_total", "Total HTTP Requests")
 
 # IdP RS256 Public Key
 IDP_PUBLIC_KEY = """-----BEGIN PUBLIC KEY-----
@@ -29,7 +39,6 @@ dQIDAQAB
 class TokenVerifyRequest(BaseModel):
     token: str
 
-# Schema for Analytics Endpoint
 class EventModel(BaseModel):
     user: str
     amount: float
@@ -44,11 +53,15 @@ async def process_request(request: Request, call_next):
     start_time = time.perf_counter()
     request_id = str(uuid.uuid4())
     origin = request.headers.get("origin")
+    path = request.url.path
+
+    # Increment global request counter
+    HTTP_REQUESTS_TOTAL.inc()
 
     # Manually handle Preflight OPTIONS requests
     if request.method == "OPTIONS":
         response = Response(status_code=204)
-        if request.url.path in ("/effective-config", "/analytics"):
+        if path in ("/effective-config", "/analytics", "/work", "/metrics", "/healthz", "/logs/tail"):
             response.headers["Access-Control-Allow-Origin"] = origin if origin else "*"
             response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
             response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-API-Key, Authorization, *"
@@ -60,16 +73,26 @@ async def process_request(request: Request, call_next):
         process_time = time.perf_counter() - start_time
         response.headers["X-Request-ID"] = request_id
         response.headers["X-Process-Time"] = f"{process_time:.6f}"
+        
+        # Log OPTIONS request
+        log_entry = {
+            "level": "INFO",
+            "ts": datetime.datetime.now(datetime.timezone.utc).isoformat() + "Z",
+            "path": path,
+            "request_id": request_id
+        }
+        LOGS_QUEUE.append(log_entry)
+        
         return response
 
-    # Process standard requests
+    # Process standard requests (GET, POST, etc.)
     try:
         response = await call_next(request)
     except Exception:
         response = JSONResponse(content={"error": "Internal Server Error"}, status_code=500)
 
     # Set CORS Headers based on path rules
-    if request.url.path in ("/effective-config", "/analytics"):
+    if path in ("/effective-config", "/analytics", "/work", "/metrics", "/healthz", "/logs/tail"):
         response.headers["Access-Control-Allow-Origin"] = origin if origin else "*"
         response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
         response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-API-Key, Authorization, *"
@@ -83,7 +106,17 @@ async def process_request(request: Request, call_next):
     response.headers["X-Request-ID"] = request_id
     response.headers["X-Process-Time"] = f"{process_time:.6f}"
 
+    # Log structured JSON request information
+    log_entry = {
+        "level": "INFO",
+        "ts": datetime.datetime.now(datetime.timezone.utc).isoformat() + "Z",
+        "path": path,
+        "request_id": request_id
+    }
+    LOGS_QUEUE.append(log_entry)
+
     return response
+
 
 # --- Question 1: Stats Endpoint ---
 @app.get("/stats")
@@ -114,6 +147,7 @@ async def get_stats(values: str = None):
         "mean": mean
     }
 
+
 # --- Question 2: JWT Verification Endpoint ---
 @app.post("/verify")
 async def verify_token(request_data: TokenVerifyRequest):
@@ -133,6 +167,7 @@ async def verify_token(request_data: TokenVerifyRequest):
         }
     except Exception:
         return JSONResponse(status_code=401, content={"valid": False})
+
 
 # --- Question 3: Effective Configuration Endpoint ---
 @app.get("/effective-config")
@@ -235,16 +270,13 @@ async def get_effective_config(request: Request):
 
     return final_config
 
+
 # --- Question 5: Analytics Aggregator Endpoint ---
 @app.post("/analytics")
 async def post_analytics(request: Request, request_data: AnalyticsRequest):
-    # Validate API Key
     api_key_header = request.headers.get("X-API-Key")
     if api_key_header != ANALYTICS_API_KEY:
-        return JSONResponse(
-            status_code=401,
-            content={"error": "Unauthorized: Invalid or missing X-API-Key"}
-        )
+        return JSONResponse(status_code=401, content={"error": "Unauthorized: Invalid or missing X-API-Key"})
 
     events = request_data.events
     total_events = len(events)
@@ -258,14 +290,12 @@ async def post_analytics(request: Request, request_data: AnalyticsRequest):
         amount = ev.amount
         unique_users_set.add(user)
 
-        # Ignore zero and negative amounts for revenue and top_user
         if amount > 0:
             revenue += amount
             user_pos_revenue[user] = user_pos_revenue.get(user, 0.0) + amount
 
     unique_users = len(unique_users_set)
 
-    # Determine top_user with the highest positive-amount sum
     if user_pos_revenue:
         top_user = max(user_pos_revenue, key=user_pos_revenue.get)
     else:
@@ -278,3 +308,34 @@ async def post_analytics(request: Request, request_data: AnalyticsRequest):
         "revenue": revenue,
         "top_user": top_user
     }
+
+
+# --- Question 6: Instrumented Work, Metrics, Logging, and Uptime ---
+
+@app.get("/work")
+async def do_work(n: int = 1):
+    # Perform computation simulation
+    sum_val = 0
+    for i in range(n * 1000):
+        sum_val += i
+    return {"email": EMAIL, "done": n}
+
+
+@app.get("/metrics")
+async def metrics():
+    # Return live Prometheus text format metrics
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
+@app.get("/healthz")
+async def healthz():
+    # Return uptime status
+    uptime = time.time() - STARTUP_TIME
+    return {"status": "ok", "uptime_s": uptime}
+
+
+@app.get("/logs/tail")
+async def get_logs(limit: int = 100):
+    # Return last N log entries
+    logs_list = list(LOGS_QUEUE)
+    return logs_list[-limit:]
