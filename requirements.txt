@@ -3,3 +3,4 @@ uvicorn
 pyjwt
 cryptography
 pydantic
+pyyaml
