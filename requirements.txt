@@ -4,3 +4,4 @@ pyjwt
 cryptography
 pydantic
 pyyaml
+prometheus_client
