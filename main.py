@@ -5,13 +5,15 @@ import jwt
 import yaml
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from typing import List
 
 app = FastAPI()
 
 # Assigned Values
 ALLOWED_ORIGIN = "https://dash-t1j7qz.example.com"
 EMAIL = "24f2002963@ds.study.iitm.ac.in"
+ANALYTICS_API_KEY = "ak_yjbfppkvvrubzm8lble13mi3"
 
 # IdP RS256 Public Key
 IDP_PUBLIC_KEY = """-----BEGIN PUBLIC KEY-----
@@ -27,6 +29,16 @@ dQIDAQAB
 class TokenVerifyRequest(BaseModel):
     token: str
 
+# Schema for Analytics Endpoint
+class EventModel(BaseModel):
+    user: str
+    amount: float
+    ts: int
+
+class AnalyticsRequest(BaseModel):
+    events: List[EventModel]
+
+
 @app.middleware("http")
 async def process_request(request: Request, call_next):
     start_time = time.perf_counter()
@@ -36,36 +48,35 @@ async def process_request(request: Request, call_next):
     # Manually handle Preflight OPTIONS requests
     if request.method == "OPTIONS":
         response = Response(status_code=204)
-        if request.url.path == "/effective-config":
-            # Allow any origin for effective-config CORS compliance
+        if request.url.path in ("/effective-config", "/analytics"):
             response.headers["Access-Control-Allow-Origin"] = origin if origin else "*"
             response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-            response.headers["Access-Control-Allow-Headers"] = "*"
+            response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-API-Key, Authorization, *"
         elif origin == ALLOWED_ORIGIN:
             response.headers["Access-Control-Allow-Origin"] = ALLOWED_ORIGIN
             response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-            response.headers["Access-Control-Allow-Headers"] = "*"
+            response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-API-Key, Authorization, *"
         
         process_time = time.perf_counter() - start_time
         response.headers["X-Request-ID"] = request_id
         response.headers["X-Process-Time"] = f"{process_time:.6f}"
         return response
 
-    # Process standard requests (GET, POST, etc.)
+    # Process standard requests
     try:
         response = await call_next(request)
     except Exception:
         response = JSONResponse(content={"error": "Internal Server Error"}, status_code=500)
 
     # Set CORS Headers based on path rules
-    if request.url.path == "/effective-config":
+    if request.url.path in ("/effective-config", "/analytics"):
         response.headers["Access-Control-Allow-Origin"] = origin if origin else "*"
         response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-        response.headers["Access-Control-Allow-Headers"] = "*"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-API-Key, Authorization, *"
     elif origin == ALLOWED_ORIGIN:
         response.headers["Access-Control-Allow-Origin"] = ALLOWED_ORIGIN
         response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-        response.headers["Access-Control-Allow-Headers"] = "*"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-API-Key, Authorization, *"
 
     # Apply mandatory middleware headers to the response
     process_time = time.perf_counter() - start_time
@@ -126,7 +137,6 @@ async def verify_token(request_data: TokenVerifyRequest):
 # --- Question 3: Effective Configuration Endpoint ---
 @app.get("/effective-config")
 async def get_effective_config(request: Request):
-    # 1. Defaults Layer
     merged = {
         "port": "8000",
         "workers": "1",
@@ -135,8 +145,7 @@ async def get_effective_config(request: Request):
         "api_key": "default-secret-000"
     }
 
-    # 2. YAML Layer (config.development.yaml)
-    yaml_config = {"log_level": "error"}  # Fallback default
+    yaml_config = {"log_level": "error"}
     if os.path.exists("config.development.yaml"):
         try:
             with open("config.development.yaml", "r") as f:
@@ -149,8 +158,7 @@ async def get_effective_config(request: Request):
     for k, v in yaml_config.items():
         merged[k] = v
 
-    # 3. .env Layer
-    env_config = {"NUM_WORKERS": "3", "APP_DEBUG": "false"}  # Fallback default
+    env_config = {"NUM_WORKERS": "3", "APP_DEBUG": "false"}
     if os.path.exists(".env"):
         try:
             with open(".env", "r") as f:
@@ -178,7 +186,6 @@ async def get_effective_config(request: Request):
     for k, v in env_mapped.items():
         merged[k] = v
 
-    # 4. OS Env Layer (APP_* prefix)
     os_mapped = {}
     for k, v in os.environ.items():
         if k.startswith("APP_"):
@@ -191,7 +198,6 @@ async def get_effective_config(request: Request):
     for k, v in os_mapped.items():
         merged[k] = v
 
-    # 5. CLI Overrides (?set=key=value)
     cli_overrides = {}
     for key, value in request.query_params.multi_items():
         if key == "set":
@@ -206,22 +212,17 @@ async def get_effective_config(request: Request):
     for k, v in cli_overrides.items():
         merged[k] = v
 
-    # --- Type Coercion Rules ---
     final_config = {}
-
-    # port -> int
     try:
         final_config["port"] = int(merged.get("port"))
     except Exception:
         final_config["port"] = 8000
 
-    # workers -> int
     try:
         final_config["workers"] = int(merged.get("workers"))
     except Exception:
         final_config["workers"] = 1
 
-    # debug -> bool (true/1/yes/on case-insensitive = true)
     def to_bool(val):
         if isinstance(val, bool):
             return val
@@ -229,11 +230,51 @@ async def get_effective_config(request: Request):
         return s in ("true", "1", "yes", "on")
 
     final_config["debug"] = to_bool(merged.get("debug"))
-
-    # log_level and other keys -> string
     final_config["log_level"] = str(merged.get("log_level", "info"))
-
-    # Masking api_key
     final_config["api_key"] = "****"
 
     return final_config
+
+# --- Question 5: Analytics Aggregator Endpoint ---
+@app.post("/analytics")
+async def post_analytics(request: Request, request_data: AnalyticsRequest):
+    # Validate API Key
+    api_key_header = request.headers.get("X-API-Key")
+    if api_key_header != ANALYTICS_API_KEY:
+        return JSONResponse(
+            status_code=401,
+            content={"error": "Unauthorized: Invalid or missing X-API-Key"}
+        )
+
+    events = request_data.events
+    total_events = len(events)
+
+    unique_users_set = set()
+    user_pos_revenue = {}
+    revenue = 0.0
+
+    for ev in events:
+        user = ev.user
+        amount = ev.amount
+        unique_users_set.add(user)
+
+        # Ignore zero and negative amounts for revenue and top_user
+        if amount > 0:
+            revenue += amount
+            user_pos_revenue[user] = user_pos_revenue.get(user, 0.0) + amount
+
+    unique_users = len(unique_users_set)
+
+    # Determine top_user with the highest positive-amount sum
+    if user_pos_revenue:
+        top_user = max(user_pos_revenue, key=user_pos_revenue.get)
+    else:
+        top_user = ""
+
+    return {
+        "email": EMAIL,
+        "total_events": total_events,
+        "unique_users": unique_users,
+        "revenue": revenue,
+        "top_user": top_user
+    }
