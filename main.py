@@ -14,10 +14,13 @@ from prometheus_client import Counter, generate_latest, CONTENT_TYPE_LATEST
 
 app = FastAPI()
 
-# --- Configurations ---
-ALLOWED_ORIGIN = "https://dash-t1j7qz.example.com"
+# --- Configs & Assigned Values ---
 EMAIL = "24f2002963@ds.study.iitm.ac.in"
 ANALYTICS_API_KEY = "ak_yjbfppkvvrubzm8lble13mi3"
+
+# Allowed Origins
+ALLOWED_ORIGIN_STATS = "https://dash-t1j7qz.example.com"    # Question 1
+ALLOWED_ORIGIN_PING = "https://app-i66xhn.example.com"      # Question 10
 
 # System Startup Tracking & Structured Log Queue (Last 1000 logs)
 STARTUP_TIME = time.time()
@@ -52,15 +55,22 @@ class AnalyticsRequest(BaseModel):
 
 
 # --- Global CORS Paths ---
-CORS_PATHS = ("/effective-config", "/analytics", "/work", "/metrics", "/healthz", "/logs/tail", "/orders")
+CORS_PATHS = ("/effective-config", "/analytics", "/work", "/metrics", "/healthz", "/logs/tail")
 
 
 @app.middleware("http")
 async def process_request(request: Request, call_next):
     start_time = time.perf_counter()
-    request_id = str(uuid.uuid4())
-    origin = request.headers.get("origin")
     path = request.url.path
+    origin = request.headers.get("origin")
+
+    # 1. Request Context Propagator (Reuse or Generate UUID)
+    request_id = request.headers.get("X-Request-ID")
+    if not request_id:
+        request_id = str(uuid.uuid4())
+    
+    # Store request_id in request state for downstream handlers
+    request.state.request_id = request_id
 
     # Increment global request counter
     HTTP_REQUESTS_TOTAL.inc()
@@ -68,14 +78,25 @@ async def process_request(request: Request, call_next):
     # Manually handle Preflight OPTIONS requests
     if request.method == "OPTIONS":
         response = Response(status_code=204)
-        if path == "/orders" or path.startswith("/orders") or path in CORS_PATHS:
+        
+        # CORS for /ping (Strict + Exam Domain allowlist)
+        if path == "/ping" or path.startswith("/ping"):
+            if origin == ALLOWED_ORIGIN_PING or (origin and ("iitm.ac.in" in origin or "localhost" in origin)):
+                response.headers["Access-Control-Allow-Origin"] = origin
+                response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+                response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Request-ID, X-Client-Id, Authorization, *"
+        
+        # CORS for /orders and other wildcard routes
+        elif path == "/orders" or path.startswith("/orders") or path in CORS_PATHS:
             response.headers["Access-Control-Allow-Origin"] = origin if origin else "*"
             response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
             response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-API-Key, Authorization, Idempotency-Key, X-Client-Id, *"
-        elif origin == ALLOWED_ORIGIN:
-            response.headers["Access-Control-Allow-Origin"] = ALLOWED_ORIGIN
+        
+        # CORS for /stats (Strict allowed origin)
+        elif origin == ALLOWED_ORIGIN_STATS:
+            response.headers["Access-Control-Allow-Origin"] = ALLOWED_ORIGIN_STATS
             response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-            response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-API-Key, Authorization, Idempotency-Key, X-Client-Id, *"
+            response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-API-Key, Authorization, *"
         
         process_time = time.perf_counter() - start_time
         response.headers["X-Request-ID"] = request_id
@@ -97,15 +118,20 @@ async def process_request(request: Request, call_next):
     except Exception:
         response = JSONResponse(content={"error": "Internal Server Error"}, status_code=500)
 
-    # Set CORS Headers based on path rules
-    if path == "/orders" or path.startswith("/orders") or path in CORS_PATHS:
+    # Set CORS Headers on GET/POST Responses
+    if path == "/ping" or path.startswith("/ping"):
+        if origin == ALLOWED_ORIGIN_PING or (origin and ("iitm.ac.in" in origin or "localhost" in origin)):
+            response.headers["Access-Control-Allow-Origin"] = origin
+            response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+            response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Request-ID, X-Client-Id, Authorization, *"
+    elif path == "/orders" or path.startswith("/orders") or path in CORS_PATHS:
         response.headers["Access-Control-Allow-Origin"] = origin if origin else "*"
         response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
         response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-API-Key, Authorization, Idempotency-Key, X-Client-Id, *"
-    elif origin == ALLOWED_ORIGIN:
-        response.headers["Access-Control-Allow-Origin"] = ALLOWED_ORIGIN
+    elif origin == ALLOWED_ORIGIN_STATS:
+        response.headers["Access-Control-Allow-Origin"] = ALLOWED_ORIGIN_STATS
         response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-        response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-API-Key, Authorization, Idempotency-Key, X-Client-Id, *"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-API-Key, Authorization, *"
 
     # Apply mandatory middleware headers to the response
     process_time = time.perf_counter() - start_time
@@ -343,29 +369,24 @@ async def get_logs(limit: int = 100):
 
 
 # --- Question 9: Idempotency, Pagination, and Rate Limiting ---
-
-# Pre-generate catalog of fixed IDs 1 to 56
 CATALOG_TOTAL = 56
 CATALOG = [{"id": i, "item": f"Item #{i}", "price": round(10.0 + i * 1.5, 2)} for i in range(1, CATALOG_TOTAL + 1)]
-
-# Store for idempotent requests: { idempotency_key: response_json }
 IDEMPOTENCY_STORE = {}
 
-# Store for rate limiting: { client_id: [timestamps] }
+# Rates for Q9
 RATE_LIMIT_STORE = {}
-RATE_LIMIT_WINDOW = 10.0  # seconds
+RATE_LIMIT_WINDOW = 10.0
 RATE_LIMIT_MAX = 18
 
 def check_rate_limit(request: Request):
     client_id = request.headers.get("X-Client-Id")
     if not client_id:
-        return None  # If header is missing, skip checking
+        return None
 
     now = time.time()
     if client_id not in RATE_LIMIT_STORE:
         RATE_LIMIT_STORE[client_id] = []
 
-    # Clean up requests outside our 10-second sliding window
     timestamps = [t for t in RATE_LIMIT_STORE[client_id] if now - t < RATE_LIMIT_WINDOW]
     RATE_LIMIT_STORE[client_id] = timestamps
 
@@ -395,17 +416,14 @@ def decode_cursor(cursor_str: str) -> int:
 
 @app.post("/orders")
 async def create_order(request: Request):
-    # 1. Enforce per-client rate limit
     rate_limit_resp = check_rate_limit(request)
     if rate_limit_resp:
         return rate_limit_resp
 
-    # 2. Enforce idempotent order creation
     idempotency_key = request.headers.get("Idempotency-Key")
     if idempotency_key:
         if idempotency_key in IDEMPOTENCY_STORE:
             saved = IDEMPOTENCY_STORE[idempotency_key]
-            # Standard HTTP idempotency returns the exact original payload
             return JSONResponse(status_code=saved["status_code"], content=saved["content"])
 
     new_id = str(uuid.uuid4())
@@ -427,17 +445,14 @@ async def create_order(request: Request):
 
 @app.get("/orders")
 async def get_orders(request: Request, limit: int = 10, cursor: str = None):
-    # 1. Enforce per-client rate limit
     rate_limit_resp = check_rate_limit(request)
     if rate_limit_resp:
         return rate_limit_resp
 
-    # 2. Process cursor-based pagination
     start_index = 0
     if cursor:
         start_index = decode_cursor(cursor)
 
-    # Slice strictly inside the fixed bounds
     items = CATALOG[start_index : start_index + limit]
 
     next_cursor = None
@@ -447,4 +462,52 @@ async def get_orders(request: Request, limit: int = 10, cursor: str = None):
     return {
         "items": items,
         "next_cursor": next_cursor
+    }
+
+
+# --- Question 10: GET /ping (CORS, Rate Limiting & Request ID Propagator) ---
+PING_LIMIT_STORE = {}
+PING_LIMIT_MAX = 13
+PING_LIMIT_WINDOW = 10.0
+
+def check_ping_rate_limit(request: Request):
+    client_id = request.headers.get("X-Client-Id")
+    if not client_id:
+        return None
+
+    now = time.time()
+    if client_id not in PING_LIMIT_STORE:
+        PING_LIMIT_STORE[client_id] = []
+
+    timestamps = [t for t in PING_LIMIT_STORE[client_id] if now - t < PING_LIMIT_WINDOW]
+    PING_LIMIT_STORE[client_id] = timestamps
+
+    if len(timestamps) >= PING_LIMIT_MAX:
+        oldest_ts = timestamps[0]
+        retry_after = int(PING_LIMIT_WINDOW - (now - oldest_ts))
+        if retry_after <= 0:
+            retry_after = 1
+        return JSONResponse(
+            status_code=429,
+            content={"error": "Too Many Requests"},
+            headers={"Retry-After": str(retry_after)}
+        )
+
+    PING_LIMIT_STORE[client_id].append(now)
+    return None
+
+
+@app.get("/ping")
+async def get_ping(request: Request):
+    # 1. Enforce Rate Limiting (13 requests / 10s)
+    rate_limit_resp = check_ping_rate_limit(request)
+    if rate_limit_resp:
+        return rate_limit_resp
+
+    # 2. Extract propagated request_id from state
+    request_id = getattr(request.state, "request_id", None)
+
+    return {
+        "email": EMAIL,
+        "request_id": request_id
     }
